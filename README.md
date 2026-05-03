@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS invitation_codes (code TEXT PRIMARY KEY, max_uses INT
 
 ### 第二步：部署 Worker 代码并绑定数据库
 1. 在 **Workers & Pages** 中点击 **Create Worker**，命名后点击 Deploy。
-2. 点击 **Edit code**，清空原有内容，将本项目的 JavaScript 代码粘贴进去并部署。
+2. 点击 **Edit code**，清空原有内容，将本项目的 worker.js 代码粘贴进去并部署。
 3. 返回 Worker 设置页 -> **Settings** -> **Bindings**。
 4. 添加 D1 绑定：变量名填 `DB`，数据库选择你刚才创建的 `email-router-db`，保存。
 
