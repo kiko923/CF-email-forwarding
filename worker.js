@@ -14,6 +14,8 @@ const DURATION_OPTIONS = [
 const DURATION_VALUES = new Set(DURATION_OPTIONS.map((i) => i.value));
 const BOOLEAN_CONFIG_KEYS = new Set(['allow_registration', 'enable_invitation_code']);
 const DURATION_CONFIG_KEYS = new Set(['max_destination_duration_hours', 'max_route_duration_hours']);
+const WILDCARD_PREFIX = '*';
+const ROUTE_PREFIX_RE = /^[a-z0-9._+-]{1,64}$/;
 
 const DEFAULT_CONFIGS = [
   ['max_users', '1000'],
@@ -77,9 +79,9 @@ const expireLocalForUser = async (db, env, userId, cfg) => {
   await db.prepare("DELETE FROM email_routes WHERE user_id=? AND status='expired'").bind(userId).run();
   await db.prepare("DELETE FROM user_destinations WHERE user_id=? AND status='expired'").bind(userId).run();
 
-  const expiredRoutes = (await db.prepare("SELECT r.id,r.cf_rule_id,d.zone_id FROM email_routes r JOIN domains d ON r.domain_id=d.id WHERE r.user_id=? AND r.status='active' AND r.expires_at IS NOT NULL AND datetime(r.expires_at)<datetime('now')").bind(userId).all()).results || [];
+  const expiredRoutes = (await db.prepare("SELECT r.id,r.cf_rule_id,r.tag,d.zone_id FROM email_routes r JOIN domains d ON r.domain_id=d.id WHERE r.user_id=? AND r.status='active' AND r.expires_at IS NOT NULL AND datetime(r.expires_at)<datetime('now')").bind(userId).all()).results || [];
   for (const route of expiredRoutes) {
-    if(route.cf_rule_id) await cfDelete(`https://api.cloudflare.com/client/v4/zones/${route.zone_id}/email/routing/rules/${route.cf_rule_id}`, env);
+    await cfRemoveEmailRoute(route, env);
     await db.prepare("DELETE FROM email_routes WHERE id=?").bind(route.id).run();
   }
 
@@ -151,6 +153,45 @@ const cfDelete = async (url, env) => {
   }
 };
 
+const cfJson = async (url, env, options = {}) => {
+  try {
+    const headers = {'Authorization':`Bearer ${env.CF_API_TOKEN}`, ...(options.headers || {})};
+    const res = await fetch(url, {...options, headers});
+    const data = await res.json().catch(() => ({success: res.ok}));
+    return {ok: res.ok && data.success !== false, data};
+  } catch (e) {
+    return {ok: false, data: {errors: [{message: e.message}]}};
+  }
+};
+
+const cfCatchAllUrl = (zoneId) => `https://api.cloudflare.com/client/v4/zones/${zoneId}/email/routing/rules/catch_all`;
+const cfGetCatchAll = (zoneId, env) => cfJson(cfCatchAllUrl(zoneId), env);
+const cfSetCatchAll = (zoneId, env, payload) => cfJson(cfCatchAllUrl(zoneId), env, {
+  method: 'PUT',
+  headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify(payload)
+});
+
+const cfEnableCatchAll = (zoneId, env, userId, destinationEmail) => cfSetCatchAll(zoneId, env, {
+  actions: [{type: 'forward', value: [destinationEmail]}],
+  matchers: [{type: 'all'}],
+  enabled: true,
+  name: `U-${userId}-catch-all`
+});
+
+const cfDisableCatchAll = (zoneId, env) => cfSetCatchAll(zoneId, env, {
+  actions: [{type: 'drop'}],
+  matchers: [{type: 'all'}],
+  enabled: false,
+  name: 'Disabled catch-all'
+});
+
+const cfRemoveEmailRoute = async (route, env) => {
+  if (route.tag === WILDCARD_PREFIX) return cfDisableCatchAll(route.zone_id, env);
+  if (route.cf_rule_id) return cfDelete(`https://api.cloudflare.com/client/v4/zones/${route.zone_id}/email/routing/rules/${route.cf_rule_id}`, env);
+  return true;
+};
+
 const normalizeDomain = (domain) => String(domain || '').trim().toLowerCase().replace(/\.$/, '');
 const isValidDomainName = (domain) => /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(domain);
 const domainBelongsToZone = (domain, zoneName) => domain === zoneName || domain.endsWith('.' + zoneName);
@@ -169,13 +210,13 @@ const runTimedCleanup = async (db, env, cfg) => {
   const tok = `Bearer ${env.CF_API_TOKEN}`, acc = env.CF_ACCOUNT_ID;
 
   const eR = await db.prepare("SELECT r.*,d.zone_id FROM email_routes r JOIN domains d ON r.domain_id=d.id WHERE r.expires_at IS NOT NULL AND datetime(r.expires_at)<datetime('now') AND r.status='active'").all();
-  for(let r of eR.results){ if(r.cf_rule_id) await fetch(`https://api.cloudflare.com/client/v4/zones/${r.zone_id}/email/routing/rules/${r.cf_rule_id}`,{method:'DELETE',headers:{'Authorization':tok}}); await db.prepare("DELETE FROM email_routes WHERE id=?").bind(r.id).run(); }
+  for(let r of eR.results){ await cfRemoveEmailRoute(r, env); await db.prepare("DELETE FROM email_routes WHERE id=?").bind(r.id).run(); }
 
   const eD = await db.prepare("SELECT * FROM user_destinations WHERE expires_at IS NOT NULL AND datetime(expires_at)<datetime('now') AND status!='expired'").all();
   for(let d of eD.results){
     if(d.cf_address_id) await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc}/email/routing/addresses/${d.cf_address_id}`,{method:'DELETE',headers:{'Authorization':tok}});
     const rr = await db.prepare("SELECT r.*,d.zone_id FROM email_routes r JOIN domains d ON r.domain_id=d.id WHERE r.user_id=? AND r.status='active'").bind(d.user_id).all();
-    for(let r of rr.results){ if(r.cf_rule_id) await fetch(`https://api.cloudflare.com/client/v4/zones/${r.zone_id}/email/routing/rules/${r.cf_rule_id}`,{method:'DELETE',headers:{'Authorization':tok}}); await db.prepare("DELETE FROM email_routes WHERE id=?").bind(r.id).run(); }
+    for(let r of rr.results){ await cfRemoveEmailRoute(r, env); await db.prepare("DELETE FROM email_routes WHERE id=?").bind(r.id).run(); }
     await db.prepare("DELETE FROM user_destinations WHERE id=?").bind(d.id).run();
   }
 
@@ -195,14 +236,14 @@ const runTimedCleanup = async (db, env, cfg) => {
 
 const deleteRouteById = async (db, env, routeId, userId) => {
   const route = await db.prepare(`
-    SELECT r.id,r.cf_rule_id,r.status,d.zone_id
+    SELECT r.id,r.cf_rule_id,r.tag,r.status,d.zone_id
     FROM email_routes r
     JOIN domains d ON r.domain_id=d.id
     WHERE r.id=? AND r.user_id=?
   `).bind(routeId, userId).first();
   if (!route) return false;
-  if (route.cf_rule_id && route.status === 'active') {
-    await cfDelete(`https://api.cloudflare.com/client/v4/zones/${route.zone_id}/email/routing/rules/${route.cf_rule_id}`, env);
+  if (route.status === 'active') {
+    await cfRemoveEmailRoute(route, env);
   }
   await db.prepare("DELETE FROM email_routes WHERE id=?").bind(route.id).run();
   return true;
@@ -210,13 +251,13 @@ const deleteRouteById = async (db, env, routeId, userId) => {
 
 const deleteUserRoutes = async (db, env, userId) => {
   const routes = (await db.prepare(`
-    SELECT r.id,r.cf_rule_id,d.zone_id
+    SELECT r.id,r.cf_rule_id,r.tag,d.zone_id
     FROM email_routes r
     JOIN domains d ON r.domain_id=d.id
     WHERE r.user_id=? AND r.status='active'
   `).bind(userId).all()).results || [];
   for (const route of routes) {
-    if (route.cf_rule_id) await cfDelete(`https://api.cloudflare.com/client/v4/zones/${route.zone_id}/email/routing/rules/${route.cf_rule_id}`, env);
+    await cfRemoveEmailRoute(route, env);
     await db.prepare("DELETE FROM email_routes WHERE id=?").bind(route.id).run();
   }
   return routes.length;
@@ -307,7 +348,7 @@ const renderUserHTML = (sitekey) => `
                 </div>
                 <form onsubmit="handleRoute(event)" class="grid grid-cols-1 lg:grid-cols-[1fr_160px_140px] gap-3">
                     <div class="flex w-full shadow-sm rounded-lg">
-                        <input type="text" id="route-prefix" class="w-1/2 px-4 py-2 bg-gray-900 border border-r-0 border-gray-700 rounded-l-lg text-white focus:ring-2 focus:ring-emerald-500 outline-none" placeholder="前缀 (如 admin)" required>
+                        <input type="text" id="route-prefix" class="w-1/2 px-4 py-2 bg-gray-900 border border-r-0 border-gray-700 rounded-l-lg text-white focus:ring-2 focus:ring-emerald-500 outline-none" placeholder="前缀 (如 admin 或 *)" required>
                         <span class="inline-flex items-center px-3 border-y border-gray-700 bg-gray-800 text-gray-500">@</span>
                         <select id="route-domain" class="w-1/2 px-4 py-2 bg-gray-900 border border-l-0 border-gray-700 rounded-r-lg text-white outline-none"></select>
                     </div>
@@ -912,8 +953,8 @@ export default {
         if (act.startsWith('/domains/') && method === 'DELETE') {
           const id = act.split('/')[2], dData = await db.prepare("SELECT zone_id FROM domains WHERE id=?").bind(id).first();
           if (dData) {
-            const rts = await db.prepare("SELECT cf_rule_id FROM email_routes WHERE domain_id=?").bind(id).all();
-            for(let r of rts.results) if(r.cf_rule_id) await fetch(`https://api.cloudflare.com/client/v4/zones/${dData.zone_id}/email/routing/rules/${r.cf_rule_id}`,{method:'DELETE',headers:{'Authorization':`Bearer ${env.CF_API_TOKEN}`}});
+            const rts = await db.prepare("SELECT cf_rule_id,tag FROM email_routes WHERE domain_id=?").bind(id).all();
+            for(let r of rts.results) await cfRemoveEmailRoute({...r, zone_id: dData.zone_id}, env);
             await db.prepare("DELETE FROM email_routes WHERE domain_id=?").bind(id).run();
             await db.prepare("DELETE FROM domains WHERE id=?").bind(id).run();
           }
@@ -1125,7 +1166,9 @@ export default {
         const {prefix, domainId, durationHours} = await req.json();
         const cleanPrefix = String(prefix || '').trim().toLowerCase();
         const chosenDuration = String(durationHours || '');
-        if(!/^[a-z0-9._+-]{1,64}$/.test(cleanPrefix)) return jsonRes({error:"邮箱前缀只能使用字母、数字、点、下划线、加号或短横线"},400);
+        const isWildcardRoute = cleanPrefix === WILDCARD_PREFIX;
+        if(cleanPrefix.includes(WILDCARD_PREFIX) && !isWildcardRoute) return jsonRes({error:"泛匹配前缀仅支持单独输入 *"},400);
+        if(!isWildcardRoute && !ROUTE_PREFIX_RE.test(cleanPrefix)) return jsonRes({error:"邮箱前缀只能使用字母、数字、点、下划线、加号、短横线，或单独输入 * 泛匹配"},400);
         if(!isValidDuration(chosenDuration)) return jsonRes({error:"请选择专属域名邮箱有效期"},400);
         if(!isWithinMaxDuration(chosenDuration, cfg.max_route_duration_hours || '72')) return jsonRes({error:"超过管理员允许的专属域名邮箱最大有效期"},403);
 
@@ -1144,12 +1187,28 @@ export default {
         if((await db.prepare("SELECT COUNT(*) as c FROM email_routes WHERE user_id=? AND status='active' AND (expires_at IS NULL OR datetime(expires_at)>datetime('now'))").bind(uS.user_id).first()).c >= cfgMaxR) return jsonRes({error:"您的专属域名邮箱配额已耗尽"},403);
 
         const dom = await db.prepare("SELECT * FROM domains WHERE id=?").bind(domainId).first(); if(!dom) return jsonRes({error:"您选择的域名不存在或已被下架"},400);
-        if(await db.prepare("SELECT id FROM email_routes WHERE domain_id=? AND tag=? AND status='active'").bind(dom.id, cleanPrefix).first()) return jsonRes({error:"该前缀已被占用，请换一个重试"},400);
+        const activeDomainRoutes = (await db.prepare("SELECT id,tag FROM email_routes WHERE domain_id=? AND status='active' AND (expires_at IS NULL OR datetime(expires_at)>datetime('now'))").bind(dom.id).all()).results || [];
+        const wildcardOwner = activeDomainRoutes.find((route) => route.tag === WILDCARD_PREFIX);
+        if(activeDomainRoutes.some((route) => route.tag === cleanPrefix)) return jsonRes({error:"该前缀已被占用，请换一个重试"},400);
+        if(isWildcardRoute && activeDomainRoutes.length) return jsonRes({error:"该域名已有专属邮箱，暂不能创建泛匹配前缀"},400);
+        if(!isWildcardRoute && wildcardOwner) return jsonRes({error:"该域名已被泛匹配前缀占用，请换一个域名"},400);
 
-        const cfR = await fetch(`https://api.cloudflare.com/client/v4/zones/${dom.zone_id}/email/routing/rules`,{method:'POST',headers:{'Authorization':`Bearer ${env.CF_API_TOKEN}`,'Content-Type':'application/json'},body:JSON.stringify({actions:[{type:"forward",value:[d.email]}],matchers:[{type:"literal",field:"to",value:`${cleanPrefix}@${dom.domain}`}],enabled:true,name:`U-${uS.user_id}-${cleanPrefix}`})});
-        const cfD = await cfR.json(); if(!cfD.success) return jsonRes({error:"该前缀已被别人占用啦，请换一个重试", details:cfD.errors},500);
+        let cfD;
+        if (isWildcardRoute) {
+          const catchAll = await cfGetCatchAll(dom.zone_id, env);
+          if(!catchAll.ok) return jsonRes({error:"无法读取 Cloudflare 泛匹配路由状态，请检查 API Token 权限", details:catchAll.data?.errors || catchAll.data},500);
+          if(catchAll.data?.result?.enabled) return jsonRes({error:"该域名已存在启用中的泛匹配路由，请先在 Cloudflare 或本系统中移除后再创建"},400);
+          const cfCatchAll = await cfEnableCatchAll(dom.zone_id, env, uS.user_id, d.email);
+          cfD = cfCatchAll.data;
+          if(!cfCatchAll.ok) return jsonRes({error:"泛匹配路由创建失败，请确认 Cloudflare Email Routing 已启用", details:cfD.errors},500);
+        } else {
+          const cfR = await fetch(`https://api.cloudflare.com/client/v4/zones/${dom.zone_id}/email/routing/rules`,{method:'POST',headers:{'Authorization':`Bearer ${env.CF_API_TOKEN}`,'Content-Type':'application/json'},body:JSON.stringify({actions:[{type:"forward",value:[d.email]}],matchers:[{type:"literal",field:"to",value:`${cleanPrefix}@${dom.domain}`}],enabled:true,name:`U-${uS.user_id}-${cleanPrefix}`})});
+          cfD = await cfR.json(); if(!cfD.success) return jsonRes({error:"该前缀已被别人占用啦，请换一个重试", details:cfD.errors},500);
+        }
 
-        await db.prepare("INSERT INTO email_routes(user_id,cf_rule_id,tag,domain_id,expires_at,duration_hours,status) VALUES(?,?,?,?,?,?,'active')").bind(uS.user_id,cfD.result.id,cleanPrefix,domainId,routeExpiry,chosenDuration).run();
+        const cfRuleId = cfD.result?.id || (isWildcardRoute ? 'catch_all' : null);
+        if(!cfRuleId) return jsonRes({error:"Cloudflare 未返回路由 ID，请稍后重试", details:cfD},500);
+        await db.prepare("INSERT INTO email_routes(user_id,cf_rule_id,tag,domain_id,expires_at,duration_hours,status) VALUES(?,?,?,?,?,?,'active')").bind(uS.user_id,cfRuleId,cleanPrefix,domainId,routeExpiry,chosenDuration).run();
         return jsonRes({success:true});
       }
       return jsonRes({error:"404 Not Found"},404);
