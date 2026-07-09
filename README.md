@@ -38,6 +38,14 @@
 * **单用户专属域名邮箱上限 (`max_routes_per_user`)**：控制每个用户最多能生成的虚拟别名数量。
 * **泛匹配专属邮箱**：用户创建专属域名邮箱时，前缀可输入 `*`，用于接收该域名下未被占用前缀的邮件。
 
+### 📬 临时邮箱与邮件记录
+* **随机临时邮箱页面 (`/random-mail`)**：管理员开启 `enable_random_inbox` 并配置 `random_inbox_domain` 后，访客首次进入页面会自动分配一个随机邮箱；刷新页面不会更换邮箱，只有点击“获取新邮箱”才会重新分配。
+* **随机邮箱后缀域名 (`random_inbox_domain`)**：填写一个已经托管在 Cloudflare 的收件域名或子域名，例如 `temp.example.com`。系统会将该域名的 catch-all 路由指向当前 Worker，用于接收任意随机前缀邮件。
+* **邮件列表 + 详情页**：临时邮箱首页只显示发件人、发件邮箱、标题和时间，点击某封邮件后进入详情页查看完整正文、HTML 内容和图片，避免大图邮件把列表撑开。
+* **内嵌图片渲染**：支持解析 `multipart/related` 邮件中的 `cid:` 图片，并自动转换为可在前端展示的 `data:image/...;base64,...`。
+* **后台邮件记录**：管理员后台新增“邮件记录”页面，会记录所有收到的邮件，包括临时邮箱、普通用户邮箱、泛匹配邮箱、拒收/未匹配邮件和转发失败邮件，并可点击查看完整详情。
+* **泛匹配路由兼容**：Cloudflare 的 catch-all 只能存在一个，本系统会让 catch-all 指向 Worker，再由 Worker 判断邮件是否属于临时邮箱、用户普通路由或用户泛匹配路由，避免互相冲突。
+
 ### ⏱️ 全自动化生命周期 (Cron 清理机制)
 * **绑定验证邮箱最大有效期 (`max_destination_duration_hours`)**：管理员可限定底层邮箱绑定的最长有效期（可选 `1小时` 至 `永久`），到期后系统自动解除绑定。
 * **专属域名邮箱最大有效期 (`max_route_duration_hours`)**：限定用户生成虚拟地址时的最长有效期（最高不能超过底层邮箱的有效期）。
@@ -80,9 +88,18 @@ CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER, ro
 
 -- 7. 邀请码表
 CREATE TABLE IF NOT EXISTS invitation_codes (code TEXT PRIMARY KEY, max_uses INTEGER NOT NULL, used_count INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+
+-- 8. 随机临时邮箱表
+CREATE TABLE IF NOT EXISTS random_inboxes (token TEXT PRIMARY KEY, prefix TEXT NOT NULL, email TEXT NOT NULL UNIQUE, domain TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+
+-- 9. 随机临时邮箱邮件表
+CREATE TABLE IF NOT EXISTS random_inbox_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, inbox_email TEXT NOT NULL, message_id TEXT, from_email TEXT, to_email TEXT NOT NULL, subject TEXT, text TEXT, html TEXT, raw TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+
+-- 10. 全量邮件记录表
+CREATE TABLE IF NOT EXISTS mail_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, mail_type TEXT NOT NULL, status TEXT NOT NULL, message_id TEXT, from_email TEXT, to_email TEXT NOT NULL, destination_email TEXT, subject TEXT, text TEXT, html TEXT, raw TEXT, route_id INTEGER, user_id INTEGER, error TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
 ```
 
-*(💡 提示：系统代码自带 Auto-Patch 机制，你只需建立空表，首次访问时系统会自动向 `sys_config` 写入默认参数)*
+*(💡 提示：系统代码自带 Auto-Patch 机制，首次访问时会自动补齐新增字段、索引和默认配置；如果你已经部署过旧版本，不需要手动删库重建。)*
 
 ### 第二步：部署 Worker 代码并绑定数据库
 1. 在 **Workers & Pages** 中点击 **Create Worker**，命名后点击 Deploy。
@@ -97,11 +114,24 @@ CREATE TABLE IF NOT EXISTS invitation_codes (code TEXT PRIMARY KEY, max_uses INT
 | :--- | :--- | :--- |
 | `CF_ACCOUNT_ID` | Cloudflare 主页右下角的 Account ID | 否 |
 | `CF_API_TOKEN` | 准备工作里申请的高权限 API Token | **是** |
+| `CF_WORKER_NAME` | 当前 Worker 的服务名，例如 Worker 地址是 `https://cf-email-forwarding.xxx.workers.dev`，这里就填 `cf-email-forwarding` | 否 |
 | `TURNSTILE_SITEKEY` | 准备工作里申请的 Site Key | 否 |
 | `TURNSTILE_SECRET` | 准备工作里申请的 Secret Key | **是** |
 | `ADMIN_USERNAME` | 自定义超级管理员账号 (如: `admin`) | 否 |
 | `ADMIN_PASSWORD` | 自定义超级管理员密码 | **是** |
 | `ADMIN_PATH` | 自定义后台隐藏入口路径 (如: `/admin-panel`) | 否 |
+
+#### `CF_WORKER_NAME` 怎么填写
+
+`CF_WORKER_NAME` 用于让系统在启用随机临时邮箱或用户泛匹配邮箱时，把 Cloudflare Email Routing 的 catch-all 路由正确指向当前 Worker。
+
+填写规则：
+
+* 如果你的 Worker 默认访问地址是 `https://cf-email-forwarding.your-account.workers.dev`，则填写：`cf-email-forwarding`
+* 如果你在 Cloudflare Workers 后台看到 Worker 名称是 `mail-worker`，则填写：`mail-worker`
+* 如果你使用自定义域名访问后台，例如 `https://mail.example.com/admin`，也建议显式填写 `CF_WORKER_NAME`，否则系统可能无法从访问域名自动判断 Worker 名称。
+
+> 启用随机临时邮箱或创建泛匹配邮箱前，请确认 `CF_WORKER_NAME`、`CF_ACCOUNT_ID`、`CF_API_TOKEN` 都已配置，并且 `CF_API_TOKEN` 具备下方附录里的 Email Routing 相关权限。
 
 > **⚠️ 极度重要**：配置完所有变量并保存后，**请一定要再去点击一次 "Edit code" -> "Deploy"**，强制系统重载最新配置！
 
@@ -113,7 +143,10 @@ CREATE TABLE IF NOT EXISTS invitation_codes (code TEXT PRIMARY KEY, max_uses INT
 
 ### 🚀 第五步：开始使用
 1. **超级管理员配置**：访问 `https://你的worker域名.workers.dev/你的ADMIN_PATH`，输入账号密码登录。点击“开放授权”你的可用域名。
-2. **普通用户访问**：分享你的 Worker 根目录链接，用户即可自由体验丝滑的无限别名邮件服务！
+2. **启用随机临时邮箱**：进入后台“域名与配置”，将 `enable_random_inbox` 设为 `true`，并将 `random_inbox_domain` 设置为临时邮箱后缀域名，例如 `temp.example.com`。保存后系统会尝试自动配置 Cloudflare catch-all 到当前 Worker。
+3. **普通用户访问**：分享你的 Worker 根目录链接，用户即可自由体验丝滑的无限别名邮件服务。
+4. **临时邮箱访问**：访问 `https://你的worker域名.workers.dev/random-mail`，系统会自动分配随机邮箱。用户刷新页面仍会保留同一个邮箱，只有点击“获取新邮箱”才会更换。
+5. **查看邮件记录**：管理员登录后台后，点击“邮件记录”，可查看所有收到的邮件及其类型、状态、转发目标和完整详情。
 
 ---
 
